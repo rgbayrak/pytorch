@@ -21,6 +21,10 @@
 
 #include <iostream>
 
+#ifdef USE_KINETO
+#include "libkineto.h"
+#endif
+
 namespace torch { namespace autograd { namespace profiler {
 
 namespace {
@@ -48,23 +52,23 @@ enum ProfilerIValueIdx {
   NUM_PROFILER_CFG_IVALUE_IDX // must be last in list
 };
 
-  const std::unordered_set<std::string> disable_cuda_profiling = {
-      "aten::view",
-      "aten::t",
-      "aten::transpose",
-      "aten::stride",
-      "aten::empty",
-      "aten::empty_like",
-      "aten::empty_strided",
-      "aten::as_strided",
-      "aten::expand",
-      "aten::resize_",
-      "aten::squeeze",
-      "aten::unsqueeze",
-      "aten::slice",
-      "aten::_unsafe_view",
-      "aten::size"
-      };
+const std::unordered_set<std::string> disable_cuda_profiling = {
+  "aten::view",
+  "aten::t",
+  "aten::transpose",
+  "aten::stride",
+  "aten::empty",
+  "aten::empty_like",
+  "aten::empty_strided",
+  "aten::as_strided",
+  "aten::expand",
+  "aten::resize_",
+  "aten::squeeze",
+  "aten::unsqueeze",
+  "aten::slice",
+  "aten::_unsafe_view",
+  "aten::size"
+};
 
 CUDAStubs default_stubs;
 constexpr CUDAStubs* default_stubs_addr = &default_stubs;
@@ -169,6 +173,54 @@ struct FileLineFunc {
   std::string funcname;
 };
 
+// TODO: figure if we can use TLS
+std::atomic<uint64_t> corr_id_ {1};
+uint64_t next_correlation_id() {
+  return corr_id_++;
+}
+
+#ifdef USE_KINETO
+struct KinetoObserverContext : public at::ObserverContext {
+  int64_t startUs;
+  uint64_t correlationId;
+  uint64_t startThreadId;
+  uint64_t endThreadId;
+  c10::optional<std::vector<std::vector<int64_t>>> shapes;
+  int64_t sequenceNr;
+  uint64_t fwdThreadId;
+  uint8_t recFunScope;
+  c10::optional<std::vector<std::string>> stack;
+};
+#endif
+
+std::vector<FileLineFunc> prepareCallstack(const std::vector<jit::StackEntry>& cs) {
+  std::vector<FileLineFunc> entries;
+  entries.reserve(cs.size());
+  for (const auto& entry : cs) {
+    auto& range = entry.range;
+    if (range.source()) {
+      auto& src = range.source();
+      if (src && src->filename()) {
+        auto line = src->starting_line_no() +
+            src->lineno_for_offset(range.start());
+        entries.emplace_back(FileLineFunc{*(src->filename()), line, entry.filename});
+      }
+    }
+  }
+  return entries;
+}
+
+std::vector<std::string> callstackStr(const std::vector<FileLineFunc>& cs) {
+  std::vector<std::string> cs_str;
+  cs_str.reserve(cs.size());
+  for (const auto& entry : cs) {
+    std::stringstream loc;
+    loc << entry.filename << "(" << entry.line << "): " << entry.funcname;
+    cs_str.push_back(loc.str());
+  }
+  return cs_str;
+}
+
 // Profiler state
 struct ProfilerThreadLocalState : public c10::MemoryReportingInfoBase {
   explicit ProfilerThreadLocalState(const ProfilerConfig& config)
@@ -203,7 +255,7 @@ struct ProfilerThreadLocalState : public c10::MemoryReportingInfoBase {
     if (config_.state == ProfilerState::NVTX) {
       cuda_stubs->nvtxMarkA(name.c_str());
     } else {
-      Event evt(
+      LegacyEvent evt(
           EventKind::Mark,
           at::StringView(std::move(name)),
           at::RecordFunction::currentThreadId(),
@@ -214,7 +266,7 @@ struct ProfilerThreadLocalState : public c10::MemoryReportingInfoBase {
   }
 
   void setOrAddRemoteProfiledEvents(
-      std::vector<Event>&& remoteProfiledEvents) {
+      std::vector<LegacyEvent>&& remoteProfiledEvents) {
     // Lock to serialize access from multiple callback threads.
     std::lock_guard<std::mutex> guard(state_mutex_);
     if (remoteProfiledEvents_) {
@@ -236,7 +288,7 @@ struct ProfilerThreadLocalState : public c10::MemoryReportingInfoBase {
       cuda_stubs->nvtxRangePushA(getNvtxStr(
           fn.name(), msg, fn.seqNr(), shapes).c_str());
     } else {
-      Event evt(
+      LegacyEvent evt(
           EventKind::PushRange,
           fn.name(),
           at::RecordFunction::currentThreadId(),
@@ -273,7 +325,7 @@ struct ProfilerThreadLocalState : public c10::MemoryReportingInfoBase {
       // called on a different thread than pushRange
       // As a convention, we put the async pop on the original
       // thread and save current thread id in pop event
-      Event evt(
+      LegacyEvent evt(
           EventKind::PopRange,
           at::StringView(""),
           at::RecordFunction::currentThreadId(),
@@ -298,7 +350,7 @@ struct ProfilerThreadLocalState : public c10::MemoryReportingInfoBase {
       c10::Device device) override {
     if (config_.profile_memory && config_.state != ProfilerState::Disabled) {
       uint64_t thread_id = at::RecordFunction::currentThreadId();
-      Event evt(
+      LegacyEvent evt(
           EventKind::MemoryAlloc,
           at::StringView(""),
           thread_id,
@@ -312,35 +364,43 @@ struct ProfilerThreadLocalState : public c10::MemoryReportingInfoBase {
     return config_.profile_memory;
   }
 
- private:
-  std::vector<FileLineFunc> prepareCallstack(const std::vector<jit::StackEntry>& cs) {
-    std::vector<FileLineFunc> entries;
-    entries.reserve(cs.size());
-    for (const auto& entry : cs) {
-      auto& range = entry.range;
-      if (range.source()) {
-        auto& src = range.source();
-        if (src && src->filename()) {
-          auto line = src->starting_line_no() +
-              src->lineno_for_offset(range.start());
-          entries.emplace_back(FileLineFunc{*(src->filename()), line, entry.filename});
+  void reportKinetoClientActivity(
+      const at::RecordFunction& fn,
+      const KinetoObserverContext& ctx) {
+#ifdef USE_KINETO
+    if (config_.state == ProfilerState::KINETO) {
+      libkineto::ClientTraceActivity op;
+      op.startTime = ctx.startUs;
+      op.endTime = (getTime() / 1000);
+      op.opType = std::string(fn.name().str());
+      op.device = 0; // CPU
+      op.correlation = ctx.correlationId;
+      if (ctx.shapes && !ctx.shapes->empty()) {
+        //op.inputDims = toStr(*ctx.shapes); //
+      }
+      //op.threadId = pthread_self();
+
+      {
+        std::lock_guard<std::mutex> guard(state_mutex_);
+        kineto_client_activities_.emplace_back(std::move(op));
+        kineto_events_.emplace_back();
+        kineto_events_.back()
+            .startThreadId(ctx.startThreadId)
+            .endThreadId(ctx.endThreadId)
+            .sequenceNr(ctx.sequenceNr)
+            .fwdThreadId(ctx.fwdThreadId)
+            .scope(ctx.recFunScope);
+        if (ctx.stack && !ctx.stack->empty()) {
+          kineto_events_.back().stack(*ctx.stack);
         }
       }
+      return;
     }
-    return entries;
+#endif
+    TORCH_CHECK(false, "Supported only in Kineto profiler");
   }
 
-  std::vector<std::string> callstackStr(const std::vector<FileLineFunc>& cs) {
-    std::vector<std::string> cs_str;
-    cs_str.reserve(cs.size());
-    for (const auto& entry : cs) {
-      std::stringstream loc;
-      loc << entry.filename << "(" << entry.line << "): " << entry.funcname;
-      cs_str.push_back(loc.str());
-    }
-    return cs_str;
-  }
-
+ private:
   std::string getNvtxStr(
       const at::StringView& name,
       const char* msg,
@@ -408,7 +468,12 @@ struct ProfilerThreadLocalState : public c10::MemoryReportingInfoBase {
 
   ProfilerConfig config_ = ProfilerConfig(ProfilerState::Disabled);
   at::CallbackHandle handle_ = 0;
-  c10::optional<std::vector<std::vector<Event>>> remoteProfiledEvents_;
+  c10::optional<std::vector<std::vector<LegacyEvent>>> remoteProfiledEvents_;
+
+#ifdef USE_KINETO
+  std::vector<libkineto::ClientTraceActivity> kineto_client_activities_;
+  std::vector<KinetoEvent> kineto_events_;
+#endif
 };
 
 ProfilerThreadLocalState* getProfilerTLSState() {
@@ -416,7 +481,25 @@ ProfilerThreadLocalState* getProfilerTLSState() {
   return dynamic_cast<ProfilerThreadLocalState*>(state.get());
 }
 
-void pushProfilingCallbacks() {
+std::vector<std::vector<int64_t>> inputSizes(const at::RecordFunction& fn) {
+  std::vector<std::vector<int64_t>> sizes;
+  sizes.reserve(fn.inputs().size());
+  for (const c10::IValue& input : fn.inputs()) {
+    if (!input.isTensor()) {
+      sizes.emplace_back();
+      continue;
+    }
+    const at::Tensor& tensor = input.toTensor();
+    if (tensor.defined()) {
+      sizes.push_back(input.toTensor().sizes().vec());
+    } else {
+      sizes.emplace_back();
+    }
+  }
+  return sizes;
+}
+
+void pushProfilingCallbacksLegacy() {
   auto state_ptr = getProfilerTLSState();
   TORCH_INTERNAL_ASSERT(state_ptr, "Expected profiler state set");
   auto handle = at::addThreadLocalCallback(at::RecordFunctionCallback(
@@ -433,21 +516,8 @@ void pushProfilingCallbacks() {
 
         auto* msg = (fn.seqNr() >= 0) ? ", seq = " : "";
         if (state_ptr->config().report_input_shapes) {
-          std::vector<std::vector<int64_t>> inputSizes;
-          inputSizes.reserve(fn.inputs().size());
-          for (const c10::IValue& input : fn.inputs()) {
-            if (!input.isTensor()) {
-              inputSizes.emplace_back();
-              continue;
-            }
-            const at::Tensor& tensor = input.toTensor();
-            if (tensor.defined()) {
-              inputSizes.push_back(input.toTensor().sizes().vec());
-            } else {
-              inputSizes.emplace_back();
-            }
-          }
-          state_ptr->pushRange(fn, record_cuda, msg, std::move(inputSizes));
+          auto sizes = inputSizes(fn);
+          state_ptr->pushRange(fn, record_cuda, msg, std::move(sizes));
         } else {
           state_ptr->pushRange(fn, record_cuda, msg);
         }
@@ -468,6 +538,66 @@ void pushProfilingCallbacks() {
     .needsIds(true));
   state_ptr->setCallbackHandle(handle);
 }
+
+#ifdef USE_KINETO
+void pushProfilingCallbacks() {
+  auto state_ptr = getProfilerTLSState();
+  TORCH_INTERNAL_ASSERT(state_ptr, "Expected profiler state set");
+  auto handle = at::addThreadLocalCallback(at::RecordFunctionCallback(
+      [](const at::RecordFunction& fn) {
+        auto state_ptr = getProfilerTLSState();
+        if (!state_ptr || state_ptr->config().state != ProfilerState::KINETO) {
+          return std::make_unique<KinetoObserverContext>();
+        }
+
+        auto corr_id = next_correlation_id();
+        libkineto::api().pushCorrelationId(corr_id);
+
+        auto ctx_ptr = std::make_unique<KinetoObserverContext>();
+        ctx_ptr->startUs = getTime() / 1000;
+        ctx_ptr->correlationId = corr_id;
+        ctx_ptr->startThreadId = at::RecordFunction::currentThreadId();
+
+        if (state_ptr->config().report_input_shapes) {
+          ctx_ptr->shapes = inputSizes(fn);
+        }
+
+        ctx_ptr->sequenceNr = fn.seqNr();
+        ctx_ptr->fwdThreadId = fn.forwardThreadId();
+        ctx_ptr->recFunScope = (uint8_t)fn.scope();
+
+#ifndef C10_MOBILE
+        // backward nodes source range corresponds to the forward node
+        // TODO: consider using C++ stack trace
+        if (state_ptr->config().with_stack &&
+            fn.scope() != at::RecordScope::BACKWARD_FUNCTION) {
+          auto cs = prepareCallstack(jit::currentCallstack());
+          if (cs.empty()) {
+            cs = prepareCallstack(jit::tracer::pythonCallstack());
+          }
+          ctx_ptr->stack = callstackStr(cs);
+        }
+#endif
+        return ctx_ptr;
+      },
+      [](const at::RecordFunction& fn, at::ObserverContext* ctx_ptr) {
+        auto state_ptr = getProfilerTLSState();
+        if (!state_ptr || state_ptr->config().state != ProfilerState::KINETO) {
+          return;
+        }
+        auto kineto_ctx_ptr = dynamic_cast<KinetoObserverContext*>(ctx_ptr);
+        TORCH_INTERNAL_ASSERT(kineto_ctx_ptr != nullptr);
+
+        kineto_ctx_ptr->endThreadId = at::RecordFunction::currentThreadId();
+
+        state_ptr->reportKinetoClientActivity(fn, *kineto_ctx_ptr);
+        libkineto::api().popCorrelationId();
+      })
+    .needsInputs(state_ptr->config().report_input_shapes)
+    .needsIds(true));
+  state_ptr->setCallbackHandle(handle);
+}
+#endif
 
 const int kCUDAWarmupStart = 5;
 
@@ -519,16 +649,26 @@ bool profilerEnabled() {
   return state_ptr && state_ptr->config().state != ProfilerState::Disabled;
 }
 
-void enableProfiler(const ProfilerConfig& new_config) {
+bool kinetoAvailable() {
+#ifdef USE_KINETO
+  return true;
+#else
+  return false;
+#endif
+}
+
+void enableProfilerLegacy(const ProfilerConfig& new_config) {
   TORCH_CHECK(new_config.state != ProfilerState::NVTX || cuda_stubs->enabled(),
     "Can't use NVTX profiler - PyTorch was compiled without CUDA");
+
+  TORCH_CHECK(new_config.state != ProfilerState::KINETO);
 
   auto state_ptr = getProfilerTLSState();
   TORCH_CHECK(!state_ptr, "Profiler is already enabled on this thread");
   auto state = std::make_shared<ProfilerThreadLocalState>(new_config);
   c10::ThreadLocalDebugInfo::_push(c10::DebugInfoKind::PROFILER_STATE, state);
 
-  pushProfilingCallbacks();
+  pushProfilingCallbacksLegacy();
 
   if (new_config.state == ProfilerState::CUDA) {
     // event recording appears to have some startup overhead, so we need to
@@ -550,7 +690,7 @@ void enableProfiler(const ProfilerConfig& new_config) {
   state->mark("__start_profile", false);
 }
 
-thread_event_lists disableProfiler(c10::optional<ProfilerDisableOptions> profilerDisableOptions) {
+thread_event_lists disableProfilerLegacy(c10::optional<ProfilerDisableOptions> profilerDisableOptions) {
   auto cleanupTLSState = profilerDisableOptions ? profilerDisableOptions->cleanupTLSState : true;
   auto consolidate = profilerDisableOptions ? profilerDisableOptions->consolidate : true;
   // all the DebugInfoBase objects are scope based and supposed to use DebugInfoGuard
@@ -578,13 +718,98 @@ thread_event_lists disableProfiler(c10::optional<ProfilerDisableOptions> profile
   return state_ptr->consolidate();
 }
 
-void addEventList(std::vector<Event>&& profiledEvents) {
+#ifdef USE_KINETO
+
+void prepareProfiler(
+    const ProfilerConfig& config,
+    const std::set<ActivityType>& activities) {
+  TORCH_CHECK(config.state == ProfilerState::KINETO,
+      "Supported only in Kineto profiler");
+
+  std::set<libkineto::ActivityType> k_activities;
+  if (activities.count(ActivityType::CPU)) {
+    k_activities.insert(libkineto::ActivityType::EXTERNAL_CORRELATION);
+    k_activities.insert(libkineto::ActivityType::CUDA_RUNTIME);
+  }
+  //if (activities.count(ActivityType::CUDA_RUNTIME)) {
+  //  k_activities.insert(libkineto::ActivityType::CUDA_RUNTIME);
+  //}
+  if (activities.count(ActivityType::CUDA)) {
+    k_activities.insert(libkineto::ActivityType::GPU_MEMCPY);
+    k_activities.insert(libkineto::ActivityType::GPU_MEMSET);
+    k_activities.insert(libkineto::ActivityType::CONCURRENT_KERNEL);
+  }
+
+  //if (!libkineto::api().hasProfilerRegistered()) {
+  //  libkineto::api().registerProfiler(
+  //    std::make_unique<libkineto::ActivityProfilerInterface>(false));
+  //}
+
+  //libkineto::api().initProfilerIfRegistered();
+  libkineto::api().prepareTrace(k_activities);
+}
+
+void enableProfiler(
+    const ProfilerConfig& config,
+    const std::set<ActivityType>& activities) {
+  TORCH_CHECK(config.state == ProfilerState::KINETO);
+  TORCH_CHECK(!activities.empty(), "No activities specified for Kineto profiler");
+
+  auto state_ptr = getProfilerTLSState();
+  TORCH_CHECK(!state_ptr, "Profiler is already enabled on this thread");
+  auto state = std::make_shared<ProfilerThreadLocalState>(config);
+  c10::ThreadLocalDebugInfo::_push(c10::DebugInfoKind::PROFILER_STATE, state);
+
+  if (activities.count(ActivityType::CPU)) {
+    pushProfilingCallbacks();
+  }
+
+  if (!libkineto::api().traceActive()) {
+    libkineto::api().startTrace();
+  }
+
+  state->mark("__start_profile", false);
+}
+
+ProfilerResult disableProfiler() {
+  // all the DebugInfoBase objects are scope based and supposed to use DebugInfoGuard
+  auto state = c10::ThreadLocalDebugInfo::_pop(c10::DebugInfoKind::PROFILER_STATE);
+
+  auto state_ptr = static_cast<ProfilerThreadLocalState*>(state.get());
+  TORCH_CHECK(state_ptr && state_ptr->config().state == ProfilerState::KINETO,
+      "Can't disable Kineto profiler when it's not running");
+
+  if (state_ptr->callbackHandle() > 0) {
+    at::removeCallback(state_ptr->callbackHandle());
+  }
+
+  state_ptr->mark("__stop_profile");
+
+  //auto trace = std::move(libkineto::api().stopTrace());
+  libkineto::api().stopTrace();
+  std::vector<std::vector<KinetoEvent>> kineto_events; // = filterTrace(trace);
+  auto legacy_events = state_ptr->consolidate();
+  return ProfilerResult(kineto_events, legacy_events);
+}
+
+KinetoEvent& KinetoEvent::activity(const libkineto::TraceActivity& activity) {
+  name_ = activity.name();
+  device_index_ = activity.deviceId();
+  start_us_ = activity.timestamp();
+  duration_us_ = activity.duration();
+  correlation_id_ = activity.correlationId();
+  return *this;
+}
+
+#endif
+
+void addEventList(std::vector<LegacyEvent>&& profiledEvents) {
   auto state_ptr = getProfilerTLSState();
   TORCH_CHECK(state_ptr, "Profiler must be enabled.");
   state_ptr->setOrAddRemoteProfiledEvents(std::move(profiledEvents));
 }
 
-void Event::record(bool record_cuda) {
+void LegacyEvent::record(bool record_cuda) {
   if (record_cuda) {
     cuda_stubs->record(&device_, &cuda_event, &cpu_ns_);
     return;
@@ -592,7 +817,7 @@ void Event::record(bool record_cuda) {
   cpu_ns_ = getTime();
 }
 
-/* static */ Event Event::fromIValue(const at::IValue& eventIValue) {
+/* static */ LegacyEvent LegacyEvent::fromIValue(const at::IValue& eventIValue) {
   TORCH_INTERNAL_ASSERT(
       eventIValue.isList(),
       "Expected IValue to contain type c10::impl::GenericList");
@@ -601,7 +826,7 @@ void Event::record(bool record_cuda) {
       ivalues.size() >= NUM_EVENT_IVALUE_IDX,
       "Expected at least ",
       NUM_EVENT_IVALUE_IDX,
-      " elements to reconstruct Event.");
+      " elements to reconstruct LegacyEvent.");
 
   // Reconstruct input shapes from ivalues.
   auto shapeListIValue = ivalues.get(EventIValueIdx::SHAPES);
@@ -627,7 +852,7 @@ void Event::record(bool record_cuda) {
     shapes.emplace_back(s);
   }
 
-  Event evt(
+  LegacyEvent evt(
       static_cast<EventKind>(
           ivalues.get(EventIValueIdx::KIND).toInt()), // EventKind
       at::StringView(ivalues.get(EventIValueIdx::NAME).toStringRef()), // name
@@ -647,7 +872,7 @@ void Event::record(bool record_cuda) {
   return evt;
 }
 
-at::IValue Event::toIValue() const {
+at::IValue LegacyEvent::toIValue() const {
   c10::impl::GenericList eventIValueList(at::AnyType::get());
   eventIValueList.reserve(NUM_EVENT_IVALUE_IDX);
   eventIValueList.emplace_back(static_cast<int64_t>(kind_));
@@ -679,7 +904,7 @@ at::IValue Event::toIValue() const {
   return at::IValue(eventIValueList);
 }
 
-double Event::cudaElapsedUs(const Event& e) const {
+double LegacyEvent::cudaElapsedUs(const LegacyEvent& e) const {
   TORCH_CHECK(e.hasCuda() && hasCuda(), "Events were not recorded for CUDA");
   TORCH_CHECK(
       e.device() == device(),
@@ -695,7 +920,6 @@ double Event::cudaElapsedUs(const Event& e) const {
 
 CUDAStubs::~CUDAStubs() = default;
 
-
 static jit::CodeTemplate event_template(R"(
 {
   "name": "${name}",
@@ -707,10 +931,10 @@ static jit::CodeTemplate event_template(R"(
   "args": {}
 })");
 
-void writeProfilerEventsToStream(std::ostream& out, const std::vector<Event*>& events) {
+void writeProfilerEventsToStream(std::ostream& out, const std::vector<LegacyEvent*>& events) {
   TORCH_CHECK(out, "Could not open file");
-  Event* profiler_start = nullptr;
-  for (Event* e : events) {
+  LegacyEvent* profiler_start = nullptr;
+  for (LegacyEvent* e : events) {
     if (0 == strcmp(e->name(), "__start_profile")) {
       profiler_start = e;
       break;
@@ -724,20 +948,20 @@ void writeProfilerEventsToStream(std::ostream& out, const std::vector<Event*>& e
       return std::hash<at::RecordFunctionHandle>()(p.first) ^ std::hash<int64_t>()(p.second);
     }
   };
-  std::unordered_map<std::pair<at::RecordFunctionHandle, int64_t>, Event*, PairHash> events_map;
+  std::unordered_map<std::pair<at::RecordFunctionHandle, int64_t>, LegacyEvent*, PairHash> events_map;
   out << "[\n";
   bool first = true;
-  for (Event* evt : events) {
-    if (evt->kind() == "push") {
+  for (LegacyEvent* evt : events) {
+    if (evt->kindStr() == "push") {
       events_map[std::make_pair(evt->handle(), evt->nodeId())] = evt;
-    } else if (evt->kind() == "pop") {
+    } else if (evt->kindStr() == "pop") {
       if (!first) {
         out << ",\n";
       }
       first = false;
       auto it = events_map.find(std::make_pair(evt->handle(), evt->nodeId()));
       TORCH_CHECK(it != events_map.end(), "Unmatched pop event");
-      Event* evt_start = it->second;
+      LegacyEvent* evt_start = it->second;
       events_map.erase(it);
 
       jit::TemplateEnv env;
@@ -751,7 +975,6 @@ void writeProfilerEventsToStream(std::ostream& out, const std::vector<Event*>& e
   out << "]\n";
 }
 
-
 RecordProfile::RecordProfile(std::ostream& out)
 : out_(out) {
   init();
@@ -763,12 +986,12 @@ RecordProfile::RecordProfile(const std::string& filename)
 }
 
 void RecordProfile::init() {
-  enableProfiler(ProfilerConfig(ProfilerState::CPU));
+  enableProfilerLegacy(ProfilerConfig(ProfilerState::CPU));
 }
 
 RecordProfile::~RecordProfile() {
-  thread_event_lists event_lists = disableProfiler();
-  std::vector<Event*> events;
+  thread_event_lists event_lists = disableProfilerLegacy();
+  std::vector<LegacyEvent*> events;
   for (auto& l : event_lists) {
     for (auto& e : l) {
         events.push_back(&e);
@@ -780,7 +1003,7 @@ RecordProfile::~RecordProfile() {
   }
 }
 
-void RecordProfile::processEvents(const std::vector<Event*>& events) {
+void RecordProfile::processEvents(const std::vector<LegacyEvent*>& events) {
   writeProfilerEventsToStream(out_, events);
 }
 
